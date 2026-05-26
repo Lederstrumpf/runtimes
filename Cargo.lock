@@ -6220,6 +6220,7 @@ dependencies = [
  "frame-system",
  "integration-tests-helpers",
  "kusama-system-emulated-network",
+ "pallet-staking-async",
  "pallet-utility",
  "pallet-whitelist",
  "pallet-xcm",

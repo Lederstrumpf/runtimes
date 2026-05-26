@@ -168,6 +168,131 @@ fn assethub_can_authorize_upgrade_for_relay_chain() {
 }
 
 #[test]
+fn assethub_can_reduce_kusama_validator_set_size() {
+	type AssetHubRuntime = <AssetHubKusama as Chain>::Runtime;
+	type AssetHubRuntimeCall = <AssetHubKusama as Chain>::RuntimeCall;
+	type AssetHubRuntimeOrigin = <AssetHubKusama as Chain>::RuntimeOrigin;
+	type AssetHubStakingCall = pallet_staking_async::Call<AssetHubRuntime>;
+	type KusamaRuntime = <Kusama as Chain>::Runtime;
+	type KusamaRuntimeCall = <Kusama as Chain>::RuntimeCall;
+
+	let target_validator_count = 700u32;
+	let min_validator_set_size_key = kusama_runtime::MinimumValidatorSetSize::key();
+	assert_eq!(
+		min_validator_set_size_key,
+		[
+			0xf3, 0xbc, 0x14, 0x3b, 0x8d, 0x00, 0x07, 0x89, 0x78, 0x3c, 0x73, 0x16, 0x62, 0xbc,
+			0xb6, 0x41,
+		],
+	);
+
+	let set_relay_min_validator_set_size: KusamaRuntimeCall =
+		frame_system::Call::<KusamaRuntime>::set_storage {
+			items: vec![(min_validator_set_size_key.to_vec(), target_validator_count.encode())],
+		}
+		.into();
+
+	let set_relay_min_validator_set_size_from_asset_hub: AssetHubRuntimeCall =
+		pallet_xcm::Call::<AssetHubRuntime>::send {
+			dest: bx!(VersionedLocation::from(AssetHubKusama::parent_location())),
+			message: bx!(VersionedXcm::from(Xcm(vec![
+				UnpaidExecution { weight_limit: Unlimited, check_origin: None },
+				Transact {
+					origin_kind: OriginKind::Superuser,
+					fallback_max_weight: None,
+					call: set_relay_min_validator_set_size.encode().into(),
+				},
+			]))),
+		}
+		.into();
+
+	let set_asset_hub_validator_count =
+		AssetHubRuntimeCall::Staking(AssetHubStakingCall::set_validator_count {
+			new: target_validator_count,
+		});
+
+	let reduce_validator_set_size = AssetHubRuntimeCall::Utility(pallet_utility::Call::<
+		AssetHubRuntime,
+	>::batch_all {
+		calls: vec![set_relay_min_validator_set_size_from_asset_hub, set_asset_hub_validator_count],
+	});
+
+	// bad origin
+	let invalid_origin: AssetHubRuntimeOrigin = Origin::StakingAdmin.into();
+	// ok origin
+	let ok_origin: AssetHubRuntimeOrigin = Origin::WhitelistedCaller.into();
+
+	let call_hash = call_hash_of::<AssetHubKusama>(&reduce_validator_set_size);
+
+	// Err - when dispatch non-whitelisted
+	assert_err!(
+		dispatch_whitelisted_call_with_preimage::<AssetHubKusama>(
+			reduce_validator_set_size.clone(),
+			ok_origin.clone()
+		),
+		DispatchError::Module(sp_runtime::ModuleError {
+			index: 94,
+			error: [3, 0, 0, 0],
+			message: Some("CallIsNotWhitelisted")
+		})
+	);
+
+	// whitelist from Kusama
+	collectives_send_whitelist(
+		Kusama::child_location_of(<AssetHubKusama as Parachain>::para_id()),
+		|| {
+			AssetHubRuntimeCall::Whitelist(
+				pallet_whitelist::Call::<AssetHubRuntime>::whitelist_call { call_hash },
+			)
+			.encode()
+		},
+	);
+	AssetHubKusama::execute_with(|| {
+		assert_whitelisted!(AssetHubKusama, call_hash);
+	});
+
+	// Err - when dispatch wrong origin
+	assert_err!(
+		dispatch_whitelisted_call_with_preimage::<AssetHubKusama>(
+			reduce_validator_set_size.clone(),
+			invalid_origin
+		),
+		DispatchError::BadOrigin
+	);
+
+	// check before
+	AssetHubKusama::execute_with(|| {
+		pallet_staking_async::ValidatorCount::<AssetHubRuntime>::put(1000);
+		assert_eq!(pallet_staking_async::ValidatorCount::<AssetHubRuntime>::get(), 1000)
+	});
+	Kusama::execute_with(|| {
+		assert_eq!(kusama_runtime::MinimumValidatorSetSize::get(), 1000);
+		assert_eq!(frame_support::storage::unhashed::get::<u32>(&min_validator_set_size_key), None);
+	});
+
+	// ok - reduced
+	assert_ok!(dispatch_whitelisted_call_with_preimage::<AssetHubKusama>(
+		reduce_validator_set_size,
+		ok_origin
+	));
+
+	// check after - reduced
+	AssetHubKusama::execute_with(|| {
+		assert_eq!(
+			pallet_staking_async::ValidatorCount::<AssetHubRuntime>::get(),
+			target_validator_count
+		)
+	});
+	Kusama::execute_with(|| {
+		assert_eq!(
+			frame_support::storage::unhashed::get::<u32>(&min_validator_set_size_key),
+			Some(target_validator_count)
+		);
+		assert_eq!(kusama_runtime::MinimumValidatorSetSize::get(), target_validator_count);
+	});
+}
+
+#[test]
 fn assethub_can_authorize_upgrade_for_system_chains() {
 	type AssetHubRuntime = <AssetHubKusama as Chain>::Runtime;
 	type AssetHubRuntimeCall = <AssetHubKusama as Chain>::RuntimeCall;
