@@ -7038,8 +7038,6 @@ dependencies = [
  "integration-tests-helpers",
  "kusama-system-emulated-network",
  "pallet-staking-async",
- "pallet-staking-async-ah-client",
- "pallet-staking-async-rc-client",
  "pallet-utility",
  "pallet-whitelist",
  "pallet-xcm",

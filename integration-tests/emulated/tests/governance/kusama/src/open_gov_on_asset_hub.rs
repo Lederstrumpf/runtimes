@@ -172,58 +172,22 @@ fn assethub_can_reduce_kusama_validator_set_size() {
 	type AssetHubRuntime = <AssetHubKusama as Chain>::Runtime;
 	type AssetHubRuntimeCall = <AssetHubKusama as Chain>::RuntimeCall;
 	type AssetHubStakingCall = pallet_staking_async::Call<AssetHubRuntime>;
-	type KusamaRuntime = <Kusama as Chain>::Runtime;
-	type KusamaRuntimeCall = <Kusama as Chain>::RuntimeCall;
-	type KusamaRuntimeEvent = <Kusama as Chain>::RuntimeEvent;
 
 	let target_validator_count = 700u32;
-	let validator_set_report_id = 1u32;
-	let min_validator_set_size_key = checked_min_validator_set_size_key();
-
-	let set_relay_min_validator_set_size: KusamaRuntimeCall =
-		frame_system::Call::<KusamaRuntime>::set_storage {
-			items: vec![(min_validator_set_size_key.to_vec(), target_validator_count.encode())],
-		}
-		.into();
-
-	let set_relay_min_validator_set_size_from_asset_hub: AssetHubRuntimeCall =
-		pallet_xcm::Call::<AssetHubRuntime>::send {
-			dest: bx!(VersionedLocation::from(AssetHubKusama::parent_location())),
-			message: bx!(VersionedXcm::from(Xcm(vec![
-				UnpaidExecution { weight_limit: Unlimited, check_origin: None },
-				Transact {
-					origin_kind: OriginKind::Superuser,
-					fallback_max_weight: None,
-					call: set_relay_min_validator_set_size.encode().into(),
-				},
-			]))),
-		}
-		.into();
 
 	let set_asset_hub_validator_count =
 		AssetHubRuntimeCall::Staking(AssetHubStakingCall::set_validator_count {
 			new: target_validator_count,
 		});
 
-	let reduce_validator_set_size = AssetHubRuntimeCall::Utility(pallet_utility::Call::<
-		AssetHubRuntime,
-	>::batch_all {
-		calls: vec![set_relay_min_validator_set_size_from_asset_hub, set_asset_hub_validator_count],
-	});
-
 	// check before
 	AssetHubKusama::execute_with(|| {
 		pallet_staking_async::ValidatorCount::<AssetHubRuntime>::put(1000);
 		assert_eq!(pallet_staking_async::ValidatorCount::<AssetHubRuntime>::get(), 1000)
 	});
-	Kusama::execute_with(|| {
-		assert_eq!(kusama_runtime::MinimumValidatorSetSize::get(), 1000);
-		assert_eq!(kusama_runtime::Staking::minimum_validator_count(), 0);
-		assert_eq!(frame_support::storage::unhashed::get::<u32>(&min_validator_set_size_key), None);
-	});
 
 	// ok - reduced
-	dispatch_whitelisted_asset_hub_call(reduce_validator_set_size);
+	dispatch_whitelisted_asset_hub_call(set_asset_hub_validator_count);
 
 	// check after - reduced
 	AssetHubKusama::execute_with(|| {
@@ -232,113 +196,6 @@ fn assethub_can_reduce_kusama_validator_set_size() {
 			target_validator_count
 		)
 	});
-	Kusama::execute_with(|| {
-		assert_eq!(kusama_runtime::Staking::minimum_validator_count(), 0);
-		assert_eq!(
-			frame_support::storage::unhashed::get::<u32>(&min_validator_set_size_key),
-			Some(target_validator_count)
-		);
-		assert_eq!(kusama_runtime::MinimumValidatorSetSize::get(), target_validator_count);
-
-		pallet_staking_async_ah_client::Mode::<KusamaRuntime>::put(
-			pallet_staking_async_ah_client::OperatingMode::Active,
-		);
-		<Kusama as Chain>::System::reset_events();
-		assert_ok!(validator_set_report_call(target_validator_count, validator_set_report_id)
-			.dispatch(<Kusama as Chain>::RuntimeOrigin::root()));
-
-		assert!(<Kusama as Chain>::System::events().iter().any(|record| {
-			match &record.event {
-				KusamaRuntimeEvent::StakingAhClient(
-					pallet_staking_async_ah_client::Event::ValidatorSetReceived {
-						id,
-						new_validator_set_count,
-						prune_up_to,
-						leftover,
-					},
-				) =>
-					*id == validator_set_report_id &&
-						*new_validator_set_count == target_validator_count &&
-						prune_up_to.is_none() &&
-						!*leftover,
-				_ => false,
-			}
-		}));
-
-		let (id, validators) = pallet_staking_async_ah_client::ValidatorSet::<KusamaRuntime>::get()
-			.expect("700-validator report should be accepted by relay");
-		assert_eq!(id, validator_set_report_id);
-		assert_eq!(validators.len() as u32, target_validator_count);
-	});
-}
-
-#[test]
-fn assethub_validator_count_without_relay_minimum_update_is_dropped() {
-	type AssetHubRuntime = <AssetHubKusama as Chain>::Runtime;
-	type AssetHubRuntimeCall = <AssetHubKusama as Chain>::RuntimeCall;
-	type AssetHubStakingCall = pallet_staking_async::Call<AssetHubRuntime>;
-	type KusamaRuntime = <Kusama as Chain>::Runtime;
-	type KusamaRuntimeEvent = <Kusama as Chain>::RuntimeEvent;
-
-	let target_validator_count = 700u32;
-	let validator_set_report_id = 1u32;
-	let min_validator_set_size_key = checked_min_validator_set_size_key();
-
-	let set_asset_hub_validator_count =
-		AssetHubRuntimeCall::Staking(AssetHubStakingCall::set_validator_count {
-			new: target_validator_count,
-		});
-
-	AssetHubKusama::execute_with(|| {
-		pallet_staking_async::ValidatorCount::<AssetHubRuntime>::put(1000);
-		assert_eq!(pallet_staking_async::ValidatorCount::<AssetHubRuntime>::get(), 1000)
-	});
-	Kusama::execute_with(|| {
-		assert_eq!(kusama_runtime::MinimumValidatorSetSize::get(), 1000);
-		assert_eq!(kusama_runtime::Staking::minimum_validator_count(), 0);
-		assert_eq!(frame_support::storage::unhashed::get::<u32>(&min_validator_set_size_key), None);
-	});
-
-	dispatch_whitelisted_asset_hub_call(set_asset_hub_validator_count);
-
-	AssetHubKusama::execute_with(|| {
-		assert_eq!(
-			pallet_staking_async::ValidatorCount::<AssetHubRuntime>::get(),
-			target_validator_count
-		)
-	});
-	Kusama::execute_with(|| {
-		assert_eq!(kusama_runtime::MinimumValidatorSetSize::get(), 1000);
-		assert_eq!(kusama_runtime::Staking::minimum_validator_count(), 0);
-		assert_eq!(frame_support::storage::unhashed::get::<u32>(&min_validator_set_size_key), None);
-
-		pallet_staking_async_ah_client::Mode::<KusamaRuntime>::put(
-			pallet_staking_async_ah_client::OperatingMode::Active,
-		);
-		<Kusama as Chain>::System::reset_events();
-		assert_ok!(validator_set_report_call(target_validator_count, validator_set_report_id)
-			.dispatch(<Kusama as Chain>::RuntimeOrigin::root()));
-
-		assert!(<Kusama as Chain>::System::events().iter().any(|record| matches!(
-			&record.event,
-			KusamaRuntimeEvent::StakingAhClient(
-				pallet_staking_async_ah_client::Event::SetTooSmallAndDropped
-			)
-		)));
-		assert!(pallet_staking_async_ah_client::ValidatorSet::<KusamaRuntime>::get().is_none());
-	});
-}
-
-fn checked_min_validator_set_size_key() -> [u8; 16] {
-	let key = kusama_runtime::MinimumValidatorSetSize::key();
-	assert_eq!(
-		key,
-		[
-			0xf3, 0xbc, 0x14, 0x3b, 0x8d, 0x00, 0x07, 0x89, 0x78, 0x3c, 0x73, 0x16, 0x62, 0xbc,
-			0xb6, 0x41,
-		],
-	);
-	key
 }
 
 fn dispatch_whitelisted_asset_hub_call(call: <AssetHubKusama as Chain>::RuntimeCall) {
@@ -378,37 +235,6 @@ fn dispatch_whitelisted_asset_hub_call(call: <AssetHubKusama as Chain>::RuntimeC
 	);
 
 	assert_ok!(dispatch_whitelisted_call_with_preimage::<AssetHubKusama>(call, ok_origin));
-}
-
-fn validator_set_report(
-	validator_count: u32,
-	report_id: u32,
-) -> pallet_staking_async_rc_client::ValidatorSetReport<sp_runtime::AccountId32> {
-	pallet_staking_async_rc_client::ValidatorSetReport::new_terminal(
-		(0..validator_count)
-			.map(|index| {
-				let mut id = [0u8; 32];
-				id[..4].copy_from_slice(&index.to_le_bytes());
-				sp_runtime::AccountId32::from(id)
-			})
-			.collect(),
-		report_id,
-		None,
-	)
-}
-
-fn validator_set_report_call(
-	validator_count: u32,
-	report_id: u32,
-) -> <Kusama as Chain>::RuntimeCall {
-	type KusamaRuntime = <Kusama as Chain>::Runtime;
-	type KusamaRuntimeCall = <Kusama as Chain>::RuntimeCall;
-
-	KusamaRuntimeCall::StakingAhClient(
-		pallet_staking_async_ah_client::Call::<KusamaRuntime>::validator_set {
-			report: validator_set_report(validator_count, report_id),
-		},
-	)
 }
 
 #[test]

@@ -2,8 +2,6 @@ import { ApiPromise, WsProvider } from '@polkadot/api';
 import { blake2AsHex } from '@polkadot/util-crypto';
 import { u8aToHex } from '@polkadot/util';
 
-const MIN_VALIDATOR_SET_SIZE_KEY = '0xf3bc143b8d000789783c731662bcb641';
-
 function usage() {
   console.error(`
 Usage: dry-run/validator-set-report.sh [OPTIONS]
@@ -122,16 +120,6 @@ function schedulerCallFor(api, callHex) {
   };
 }
 
-function decodeLittleEndianU32(hex) {
-  if (!hex || hex === '0x') return null;
-  const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
-  if (clean.length < 8) return null;
-  return Number.parseInt(
-    clean.slice(6, 8) + clean.slice(4, 6) + clean.slice(2, 4) + clean.slice(0, 2),
-    16,
-  );
-}
-
 async function printPreState(api) {
   const mode = api.query.stakingAhClient?.mode
     ? (await api.query.stakingAhClient.mode()).toString()
@@ -142,14 +130,6 @@ async function printPreState(api) {
     const minimumValidatorCount = await api.query.staking.minimumValidatorCount();
     console.log(`Staking.minimumValidatorCount: ${minimumValidatorCount.toString()}`);
   }
-
-  const rawMin = await api.rpc.state.getStorage(MIN_VALIDATOR_SET_SIZE_KEY);
-  const rawHex = rawMin?.toHex?.() ?? null;
-  const rawValue = decodeLittleEndianU32(rawHex);
-  console.log(
-    `MinimumValidatorSetSize override: ${rawHex ?? '<none>'}` +
-      (rawValue === null ? '' : ` (${rawValue})`),
-  );
 }
 
 function printEvents(events, label) {
