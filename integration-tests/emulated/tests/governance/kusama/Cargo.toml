@@ -9,24 +9,33 @@ publish = false
 
 [dependencies]
 codec = { workspace = true, default-features = true }
+hex-literal = { workspace = true }
 
 # Substrate
+sp-core = { workspace = true, default-features = true }
 sp-runtime = { workspace = true, default-features = true }
 frame-support = { workspace = true, default-features = true }
 frame-system = { workspace = true, default-features = true }
 pallet-whitelist = { workspace = true, default-features = true }
 pallet-staking-async = { workspace = true, default-features = true }
 pallet-utility = { workspace = true, default-features = true }
+pallet-scheduler = { workspace = true, default-features = true }
+pallet-broker = { workspace = true, default-features = true }
+pallet-session = { workspace = true, default-features = true }
 
 # Cumulus
 emulated-integration-tests-common = { workspace = true }
 
 # Polkadot
 pallet-xcm = { workspace = true, default-features = true }
+polkadot-primitives = { workspace = true, default-features = true }
+runtime-parachains = { workspace = true, default-features = true }
 xcm = { workspace = true, default-features = true }
 
 # Local
 asset-hub-kusama-runtime = { workspace = true }
+kusama-runtime-constants = { workspace = true, default-features = true }
+coretime-kusama-runtime = { workspace = true }
 integration-tests-helpers = { workspace = true }
 people-kusama-runtime = { workspace = true }
 kusama-runtime = { workspace = true }

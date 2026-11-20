@@ -46,3 +46,6 @@ mod open_gov_on_asset_hub;
 
 #[cfg(test)]
 mod open_gov_on_relay;
+
+#[cfg(test)]
+mod validator_set_reduction_500_300;

@@ -198,7 +198,19 @@ fn assethub_can_reduce_kusama_validator_set_size() {
 	});
 }
 
-fn dispatch_whitelisted_asset_hub_call(call: <AssetHubKusama as Chain>::RuntimeCall) {
+pub(crate) fn dispatch_whitelisted_asset_hub_call(call: <AssetHubKusama as Chain>::RuntimeCall) {
+	dispatch_whitelisted_asset_hub_call_and(call, || {});
+}
+
+/// Same checks as [`dispatch_whitelisted_asset_hub_call`] (not whitelisted ->
+/// `CallIsNotWhitelisted`, Fellowship whitelists over XCM, StakingAdmin -> `BadOrigin`,
+/// WhitelistedCaller -> ok). `in_same_block` runs right after the successful dispatch, inside the
+/// same Asset Hub block. The emulator clears Asset Hub events at the end of every block, so this is
+/// where a caller can assert the dispatch's events and read that block's relay block number.
+pub(crate) fn dispatch_whitelisted_asset_hub_call_and(
+	call: <AssetHubKusama as Chain>::RuntimeCall,
+	in_same_block: impl FnOnce(),
+) {
 	type AssetHubRuntime = <AssetHubKusama as Chain>::Runtime;
 	type AssetHubRuntimeCall = <AssetHubKusama as Chain>::RuntimeCall;
 	type AssetHubRuntimeOrigin = <AssetHubKusama as Chain>::RuntimeOrigin;
@@ -234,7 +246,16 @@ fn dispatch_whitelisted_asset_hub_call(call: <AssetHubKusama as Chain>::RuntimeC
 		DispatchError::BadOrigin
 	);
 
-	assert_ok!(dispatch_whitelisted_call_with_preimage::<AssetHubKusama>(call, ok_origin));
+	// `dispatch_whitelisted_call_with_preimage` inlined, so `in_same_block` sees this block.
+	AssetHubKusama::execute_with(|| {
+		let whitelist_call: AssetHubRuntimeCall =
+			pallet_whitelist::Call::<AssetHubRuntime>::dispatch_whitelisted_call_with_preimage {
+				call: Box::new(call),
+			}
+			.into();
+		assert_ok!(whitelist_call.dispatch(ok_origin));
+		in_same_block();
+	});
 }
 
 #[test]
