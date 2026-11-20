@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the preimage for validator set 700 -> 500 -> 300 proposal, with cores
-# 140 -> 100 -> 60, from live Kusama Asset Hub and Coretime metadata.
+# 140 -> 100 -> 60 and n_delay_tranches 299 -> 214 -> 128, from live Kusama Asset Hub,
+# relay and Coretime metadata.
 #
 # Prerequisites (from dry-run/):
 #   npm install @polkadot/api @polkadot/util @polkadot/util-crypto

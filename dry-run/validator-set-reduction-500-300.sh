@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Assertion suite for validator set 700 -> 500 -> 300 proposal, with cores
-# 140 -> 100 -> 60 on chopsticks xcm fork of Kusama Asset Hub, relay and Coretime.
+# 140 -> 100 -> 60 and n_delay_tranches 299 -> 214 -> 128 on chopsticks xcm fork of
+# Kusama Asset Hub, relay and Coretime.
 #
 # Prerequisites (from dry-run/):
 #   npm install @polkadot/api @polkadot/util @polkadot/util-crypto

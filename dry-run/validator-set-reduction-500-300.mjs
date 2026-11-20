@@ -9,31 +9,35 @@ import {
 import { readFileSync, writeFileSync } from "node:fs";
 
 // Assertion suite for validator set 700 -> 500 -> 300 proposal, with cores
-// 140 -> 100 -> 60 on chopsticks xcm fork of Kusama Asset Hub, relay and Coretime.
+// 140 -> 100 -> 60 and n_delay_tranches 299 -> 214 -> 128 on chopsticks xcm fork of
+// Kusama Asset Hub, relay and Coretime.
 //
 // Every write goes to the local forks through chopsticks dev_* RPCs. Exits non-zero on any FAIL.
 // The pinned bytes below are the output of validator-set-reduction-500-300-preimage.sh.
 
 const PREIMAGE = {
     outerHex:
-        "0x5e0328020c5909d1071f0005010100b50f05082f0000060200a02802083212640032000a000000c0890100c0890100b01300000084d71701340080c3c901b013000007056b736d2d76616c696461746f722d7365742d726564756374696f6e2d6c656732c0b00700003f2802085909b1041f0005010100b50f05082f00000602001032123c00",
-    outerLen: 134,
+        "0x5e032802105909d1071f0005010005082f0000060200183313d60000001f0005010100b50f05082f0000060200a02802083212640032000a000000c0890100c0890100b01300000084d71701340080c3c901b013000007056b736d2d76616c696461746f722d7365742d726564756374696f6e2d6c656732c0b00700003f28020c5909b1041f0005010005082f0000060200183313800000001f0005010100b50f05082f00000602001032123c00",
+    outerLen: 174,
     outerHash:
-        "0x41e8d93e56dfb24ce4fa2016c7022eace1017916c032767d8a077d5b54f35d71",
-    innerLen: 132,
+        "0xb4efb4f5228cfe09b6df3f8e4938a2e514febc7c8858f87751a65060f46f239c",
+    innerLen: 172,
     innerHash:
-        "0x18500999935b29c36f230b9dfc68786210c0355dbf2528e3c62ff6d7ac1e387e",
-    leg2Hex: "0x2802085909b1041f0005010100b50f05082f00000602001032123c00",
+        "0xc7817c613b1756c81bf7139de882f6ecaff4d1e8835db2ce701404ef709280e8",
+    leg2Hex:
+        "0x28020c5909b1041f0005010005082f0000060200183313800000001f0005010100b50f05082f00000602001032123c00",
     coretimeLeg1Hex:
         "0x2802083212640032000a000000c0890100c0890100b01300000084d71701340080c3c901b0130000",
     coretimeLeg2Hex: "0x32123c00",
+    relayLeg1Hex: "0x3313d6000000",
+    relayLeg2Hex: "0x331380000000",
     leg2Id: "ksm-validator-set-reduction-leg2",
     leg2After: 504000,
     priority: 63,
     coretimeParaId: 1005,
     assetHubParaId: 1000,
-    leg1: { validators: 500, cores: 100 },
-    leg2: { validators: 300, cores: 60 },
+    leg1: { validators: 500, cores: 100, nDelayTranches: 214 },
+    leg2: { validators: 300, cores: 60, nDelayTranches: 128 },
     saleCap: 52,
     // Live broker.configuration the preimage is built from.
     liveBrokerConfig: {
@@ -50,12 +54,27 @@ const PREIMAGE = {
     liveValidatorCount: 700,
     liveNumCores: 140,
     liveMaxValidatorsPerCore: 5,
+    liveNDelayTranches: 299,
 };
 const LEG2_ID_HEX = stringToHex(PREIMAGE.leg2Id);
 const PROPOSED_BROKER_CONFIG = {
     ...PREIMAGE.liveBrokerConfig,
     limitCoresOffered: PREIMAGE.saleCap,
 };
+const RELAY_DEST = { v5: { parents: 1, interior: { here: null } } };
+const CORETIME_DEST = {
+    v5: {
+        parents: 1,
+        interior: { x1: [{ parachain: PREIMAGE.coretimeParaId }] },
+    },
+};
+// Validators per delay tranche must not drop below the plan's lowest steady state, 500 / 214
+// (2.336; 700 / 299 is 2.341). Cutting validators before tranches would give 500 / 299.
+const MIN_PER_TRANCHE = Math.min(
+    PREIMAGE.liveValidatorCount / PREIMAGE.liveNDelayTranches,
+    PREIMAGE.leg1.validators / PREIMAGE.leg1.nDelayTranches,
+    PREIMAGE.leg2.validators / PREIMAGE.leg2.nDelayTranches,
+);
 
 // ---------------------------------------------------------------------------
 // CLI parsing
@@ -399,6 +418,7 @@ async function groupsView(relay) {
         sessionValidators: (await relay.query.session.validators()).length,
         numCores: cfg.schedulerParams.numCores,
         maxValidatorsPerCore: cfg.schedulerParams.maxValidatorsPerCore,
+        nDelayTranches: cfg.nDelayTranches,
         groups: groups.length,
         groupSizes: sizes,
         pending: (await relay.query.configuration.pendingConfigs())
@@ -406,15 +426,29 @@ async function groupsView(relay) {
             .map(([s, c]) => ({
                 session: s,
                 numCores: c.schedulerParams.numCores,
+                nDelayTranches: c.nDelayTranches,
             })),
     };
 }
 
-/** AH -> Coretime (HRMP) -> relay (UMP): build blocks and check each hop for one leg. */
+/** Config fields the proposal changes on the relay. */
+function withoutChanged(cfg) {
+    return {
+        ...cfg,
+        nDelayTranches: undefined,
+        schedulerParams: { ...cfg.schedulerParams, numCores: undefined },
+    };
+}
+
+/**
+ * Build blocks and check each hop for one leg: AH -> relay (UMP) for n_delay_tranches, and
+ * AH -> Coretime (HRMP) -> relay (UMP) for num_cores. The two may land in different relay blocks;
+ * pending configs for the same session merge.
+ */
 async function checkPropagation(
     tag,
     { ct, relay },
-    cores,
+    { cores, nDelayTranches },
     expectConfig,
     marks = {},
 ) {
@@ -455,69 +489,85 @@ async function checkPropagation(
     eq(`${tag}: broker.configuration`, await brokerConfig(ct), expectConfig);
 
     section(`${tag}: relay`);
-    const before = await relayConfigView(relay);
+    // The AH -> relay message may already be in a relay block built before this point.
+    const before = marks.relayConfig ?? (await relayConfigView(relay));
     const rFrom = marks.relay ?? (await head(relay)) + 1;
+    const umpFrom = (events, para) =>
+        find(
+            events,
+            "messageQueue.Processed",
+            (e) => e.data.origin.toJSON()?.ump?.para === para,
+        );
     let rEvents = [];
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
         await newBlocks(relay, 1);
         rEvents = await eventsFrom(relay, rFrom);
         if (
-            find(
-                rEvents,
-                "messageQueue.Processed",
-                (e) =>
-                    e.data.origin.toJSON()?.ump?.para ===
-                    PREIMAGE.coretimeParaId,
-            ).length
+            umpFrom(rEvents, PREIMAGE.assetHubParaId).length &&
+            umpFrom(rEvents, PREIMAGE.coretimeParaId).length
         )
             break;
     }
-    // Coretime may send other UMP in the same blocks (its regular broker traffic), so require at
-    // least one, all successful. PendingConfigs below checks that ours landed.
-    const ump = find(
-        rEvents,
-        "messageQueue.Processed",
-        (e) => e.data.origin.toJSON()?.ump?.para === PREIMAGE.coretimeParaId,
-    );
-    check(
-        `${tag}: relay processed the broker's UMP (messageQueue.Processed from para ${PREIMAGE.coretimeParaId}, all success)`,
-        ump.length >= 1 && ump.every((e) => e.event.data.success.isTrue),
-        names(rEvents, /^(messageQueue|coretime|configuration)\./),
-    );
+    // AH and Coretime may send other UMP in the same blocks (staking and broker traffic), so
+    // require at least one from each, all successful. PendingConfigs below checks that ours landed.
+    for (const [who, para] of [
+        ["AH's", PREIMAGE.assetHubParaId],
+        ["the broker's", PREIMAGE.coretimeParaId],
+    ]) {
+        const ump = umpFrom(rEvents, para);
+        check(
+            `${tag}: relay processed ${who} UMP (messageQueue.Processed from para ${para}, all success)`,
+            ump.length >= 1 && ump.every((e) => e.event.data.success.isTrue),
+            names(rEvents, /^(messageQueue|coretime|configuration)\./),
+        );
+    }
     const after = await relayConfigView(relay);
     const last = after.pending[after.pending.length - 1];
     check(`${tag}: relay has a pending config`, !!last, after.pending);
     if (last) {
         eq(
-            `${tag}: pending num_cores`,
-            last[1].schedulerParams.numCores,
-            cores,
+            `${tag}: pending num_cores / n_delay_tranches`,
+            [last[1].schedulerParams.numCores, last[1].nDelayTranches],
+            [cores, nDelayTranches],
         );
         eq(
             `${tag}: pending config applies at session + 2`,
             last[0],
             after.sharedSession + 2,
         );
+        // If the two messages straddled a session change there are two new entries; each may
+        // carry either change, so compare every entry with the rest masked.
         const base = before.pending.length
             ? before.pending[before.pending.length - 1][1]
             : before.active;
-        const expected = {
-            ...base,
-            schedulerParams: { ...base.schedulerParams, numCores: cores },
-        };
-        eq(
-            `${tag}: pending config differs from the previous one only in num_cores`,
-            last[1],
-            expected,
+        const oldCores = base.schedulerParams.numCores;
+        const oldTranches = base.nDelayTranches;
+        check(
+            `${tag}: pending configs differ from the previous one only in num_cores and n_delay_tranches`,
+            after.pending.every(
+                ([, c]) =>
+                    stable(withoutChanged(c)) ===
+                        stable(withoutChanged(base)) &&
+                    [oldCores, cores].includes(c.schedulerParams.numCores) &&
+                    [oldTranches, nDelayTranches].includes(c.nDelayTranches),
+            ),
+            { base, pending: after.pending },
         );
     }
     check(
-        `${tag}: active num_cores unchanged until the session change`,
+        `${tag}: active num_cores and n_delay_tranches unchanged until the session change`,
         after.active.schedulerParams.numCores ===
-            before.active.schedulerParams.numCores,
+            before.active.schedulerParams.numCores &&
+            after.active.nDelayTranches === before.active.nDelayTranches,
         {
-            before: before.active.schedulerParams.numCores,
-            after: after.active.schedulerParams.numCores,
+            before: [
+                before.active.schedulerParams.numCores,
+                before.active.nDelayTranches,
+            ],
+            after: [
+                after.active.schedulerParams.numCores,
+                after.active.nDelayTranches,
+            ],
         },
     );
     return { pendingAt: last?.[0] };
@@ -630,18 +680,20 @@ async function checkBrokerNotified(ct, cores, tag) {
 }
 
 /**
- * Rotate until the pending num_cores and the queued validator set are both active, checking the
- * groups after every rotation. While the old (larger) set is active, the groups stay at
- * `oldValidators / 5` groups of 5 whatever num_cores is (cores are cut first, so no capacity is
- * lost early).
+ * Rotate until the pending config and the queued validator set are both active, checking the
+ * groups and n_delay_tranches after every rotation. While the old (larger) set is active, the
+ * groups stay at `oldValidators / 5` groups of 5 whatever num_cores is (cores are cut first, so
+ * no capacity is lost early). Validators per delay tranche must never drop below MIN_PER_TRANCHE.
  */
 async function sessionsAfterLeg(
     tag,
     { relay, ct },
-    { pendingAt, oldValidators, newValidators, cores },
+    { pendingAt, oldValidators, newValidators, cores, nDelayTranches },
 ) {
     section(`${tag}: relay sessions`);
     const sQueue = (await relay.query.session.currentIndex()).toNumber();
+    const oldTranches = (await relay.query.configuration.activeConfig())
+        .nDelayTranches.toNumber();
     await queueValidatorSet(relay, newValidators);
     const target = Math.max(pendingAt ?? sQueue, sQueue + 2);
     let notified = false;
@@ -654,6 +706,17 @@ async function sessionsAfterLeg(
             ok: true,
             detail: { ...v, rotation: r },
         });
+        const perTranche = v.sessionValidators / v.nDelayTranches;
+        check(
+            `${tag}: session ${v.session}: validators per delay tranche ${v.sessionValidators}/${v.nDelayTranches} >= ${MIN_PER_TRANCHE.toFixed(3)}`,
+            perTranche >= MIN_PER_TRANCHE,
+            { perTranche, min: MIN_PER_TRANCHE },
+        );
+        eq(
+            `${tag}: session ${v.session}: n_delay_tranches ${v.session >= pendingAt ? nDelayTranches : oldTranches}`,
+            v.nDelayTranches,
+            v.session >= pendingAt ? nDelayTranches : oldTranches,
+        );
         if (v.numCores === cores && !notified) {
             await checkBrokerNotified(ct, cores, tag);
             notified = true;
@@ -672,9 +735,9 @@ async function sessionsAfterLeg(
             continue;
         }
         eq(
-            `${tag}: session ${v.session}: num_cores ${cores} active`,
-            v.numCores,
-            cores,
+            `${tag}: session ${v.session}: num_cores ${cores} and n_delay_tranches ${nDelayTranches} active`,
+            [v.numCores, v.nDelayTranches],
+            [cores, nDelayTranches],
         );
         eq(
             `${tag}: session ${v.session}: ${newValidators} validators active`,
@@ -715,21 +778,23 @@ async function main() {
     section("Encoding");
     if (opts.preimageJson) {
         const pj = JSON.parse(readFileSync(opts.preimageJson, "utf8"));
-        eq(
-            "--preimage-json proposal.hex equals the pinned outer hex",
-            pj.proposal.hex,
-            PREIMAGE.outerHex,
-        );
-        eq(
-            "--preimage-json leg2.hex equals the pinned leg-2 hex",
-            pj.leg2.hex,
-            PREIMAGE.leg2Hex,
-        );
-        eq(
-            "--preimage-json coretimeLeg1.hex equals the pinned Coretime hex",
-            pj.coretimeLeg1.hex,
-            PREIMAGE.coretimeLeg1Hex,
-        );
+        for (const [field, actual, expected] of [
+            ["proposal.hex", pj.proposal.hex, PREIMAGE.outerHex],
+            ["proposal.len", pj.proposal.len, PREIMAGE.outerLen],
+            ["proposal.blake2_256", pj.proposal.blake2_256, PREIMAGE.outerHash],
+            ["inner.len", pj.inner.len, PREIMAGE.innerLen],
+            ["inner.blake2_256", pj.inner.blake2_256, PREIMAGE.innerHash],
+            ["leg2.hex", pj.leg2.hex, PREIMAGE.leg2Hex],
+            ["coretimeLeg1.hex", pj.coretimeLeg1.hex, PREIMAGE.coretimeLeg1Hex],
+            ["coretimeLeg2.hex", pj.coretimeLeg2.hex, PREIMAGE.coretimeLeg2Hex],
+            ["relayLeg1.hex", pj.relayLeg1.hex, PREIMAGE.relayLeg1Hex],
+            ["relayLeg2.hex", pj.relayLeg2.hex, PREIMAGE.relayLeg2Hex],
+        ])
+            eq(
+                `--preimage-json ${field} equals the pinned value`,
+                actual,
+                expected,
+            );
     }
     eq("outer length", (PREIMAGE.outerHex.length - 2) / 2, PREIMAGE.outerLen);
     eq(
@@ -753,55 +818,59 @@ async function main() {
     eq("outer re-encodes byte for byte", outer.toHex(), PREIMAGE.outerHex);
     const batch = inner.args[0];
     eq(
-        "inner is utility.batchAll of 3",
+        "inner is utility.batchAll of 4",
         [`${inner.section}.${inner.method}`, batch.length],
-        ["utility.batchAll", 3],
+        ["utility.batchAll", 4],
     );
     eq(
         "call 1: staking.setValidatorCount(500)",
         [`${batch[0].section}.${batch[0].method}`, batch[0].args[0].toNumber()],
         ["staking.setValidatorCount", PREIMAGE.leg1.validators],
     );
-    eq(
-        "call 2: polkadotXcm.send to Coretime",
-        [`${batch[1].section}.${batch[1].method}`, batch[1].args[0].toJSON()],
-        [
-            "polkadotXcm.send",
-            {
-                v5: {
-                    parents: 1,
-                    interior: { x1: [{ parachain: PREIMAGE.coretimeParaId }] },
+    // An XCM send in the proposal's shape: V5 dest, UnpaidExecution{Unlimited,None},
+    // Transact{Superuser,None,call}. Returns the transported call's hex.
+    const checkSend = (name, send, dest) => {
+        eq(
+            `${name}: polkadotXcm.send to ${stable(dest)}`,
+            [`${send.section}.${send.method}`, send.args[0].toJSON()],
+            ["polkadotXcm.send", dest],
+        );
+        const xcm = send.args[1].asV5;
+        eq(
+            `${name}: XCM is UnpaidExecution{Unlimited,None}, Transact{Superuser,None}`,
+            [
+                xcm.length,
+                xcm[0].toJSON(),
+                xcm[1].asTransact.originKind.toString(),
+                xcm[1].asTransact.fallbackMaxWeight.toJSON(),
+            ],
+            [
+                2,
+                {
+                    unpaidExecution: {
+                        weightLimit: { unlimited: null },
+                        checkOrigin: null,
+                    },
                 },
-            },
-        ],
-    );
-    const leg1Xcm = batch[1].args[1].asV5;
+                "Superuser",
+                null,
+            ],
+        );
+        return u8aToHex(xcm[1].asTransact.call.encoded.toU8a(true));
+    };
     eq(
-        "call 2: XCM is UnpaidExecution{Unlimited,None}, Transact{Superuser,None}",
-        [
-            leg1Xcm[0].toJSON(),
-            leg1Xcm[1].asTransact.originKind.toString(),
-            leg1Xcm[1].asTransact.fallbackMaxWeight.toJSON(),
-        ],
-        [
-            {
-                unpaidExecution: {
-                    weightLimit: { unlimited: null },
-                    checkOrigin: null,
-                },
-            },
-            "Superuser",
-            null,
-        ],
+        "call 2: Transact carries the relay leg-1 call",
+        checkSend("call 2", batch[1], RELAY_DEST),
+        PREIMAGE.relayLeg1Hex,
     );
     eq(
-        "call 2: Transact carries the Coretime leg-1 call",
-        u8aToHex(leg1Xcm[1].asTransact.call.encoded.toU8a(true)),
+        "call 3: Transact carries the Coretime leg-1 call",
+        checkSend("call 3", batch[2], CORETIME_DEST),
         PREIMAGE.coretimeLeg1Hex,
     );
-    const sched = batch[2];
+    const sched = batch[3];
     eq(
-        "call 3: scheduler.scheduleNamedAfter(id, 504000, None, 63, leg2)",
+        "call 4: scheduler.scheduleNamedAfter(id, 504000, None, 63, leg2)",
         [
             `${sched.section}.${sched.method}`,
             sched.args[0].toHex(),
@@ -819,6 +888,43 @@ async function main() {
             PREIMAGE.leg2Hex,
         ],
     );
+    const leg2Batch = sched.args[4].args[0];
+    eq(
+        "leg 2: utility.batchAll[staking.setValidatorCount(300), send relay, send Coretime]",
+        [
+            `${sched.args[4].section}.${sched.args[4].method}`,
+            leg2Batch.length,
+            `${leg2Batch[0].section}.${leg2Batch[0].method}`,
+            leg2Batch[0].args[0].toNumber(),
+        ],
+        [
+            "utility.batchAll",
+            3,
+            "staking.setValidatorCount",
+            PREIMAGE.leg2.validators,
+        ],
+    );
+    eq(
+        "leg 2 call 2: Transact carries the relay leg-2 call",
+        checkSend("leg 2 call 2", leg2Batch[1], RELAY_DEST),
+        PREIMAGE.relayLeg2Hex,
+    );
+    eq(
+        "leg 2 call 3: Transact carries the Coretime leg-2 call",
+        checkSend("leg 2 call 3", leg2Batch[2], CORETIME_DEST),
+        PREIMAGE.coretimeLeg2Hex,
+    );
+    for (const [leg, hex, n] of [
+        [1, PREIMAGE.relayLeg1Hex, PREIMAGE.leg1.nDelayTranches],
+        [2, PREIMAGE.relayLeg2Hex, PREIMAGE.leg2.nDelayTranches],
+    ]) {
+        const c = relay.registry.createType("Call", hex);
+        eq(
+            `relay leg ${leg}: configuration.setNDelayTranches(${n})`,
+            [`${c.section}.${c.method}`, c.args[0].toNumber(), c.toHex()],
+            ["configuration.setNDelayTranches", n, hex],
+        );
+    }
     const ctLeg1 = ct.registry.createType("Call", PREIMAGE.coretimeLeg1Hex);
     const ctCalls = ctLeg1.args[0];
     eq(
@@ -866,6 +972,11 @@ async function main() {
             rc0.active.schedulerParams.maxValidatorsPerCore,
         ],
         [PREIMAGE.liveNumCores, PREIMAGE.liveMaxValidatorsPerCore],
+    );
+    eq(
+        "relay active n_delay_tranches",
+        rc0.active.nDelayTranches,
+        PREIMAGE.liveNDelayTranches,
     );
     eq("relay has no pending config", rc0.pending, []);
     eq(
@@ -953,6 +1064,7 @@ async function main() {
     const leg1Marks = {
         ct: (await head(ct)) + 1,
         relay: (await head(relay)) + 1,
+        relayConfig: await relayConfigView(relay),
     };
     const leg1 = await enact(ah, PREIMAGE.outerHex, {
         Origins: "WhitelistedCaller",
@@ -981,16 +1093,11 @@ async function main() {
         names(leg1.events, /^utility\./),
     );
     eq(
-        "polkadotXcm.Sent to Coretime",
+        "polkadotXcm.Sent to the relay, then to Coretime",
         find(leg1.events, "polkadotXcm.Sent").map((e) =>
             e.event.data.destination.toJSON(),
         ),
-        [
-            {
-                parents: 1,
-                interior: { x1: [{ parachain: PREIMAGE.coretimeParaId }] },
-            },
-        ],
+        [RELAY_DEST.v5, CORETIME_DEST.v5],
     );
     const scheduled = find(leg1.events, "scheduler.Scheduled").map((e) =>
         e.event.data.when.toNumber(),
@@ -1025,7 +1132,7 @@ async function main() {
     const leg1Prop = await checkPropagation(
         "leg 1",
         { ct, relay },
-        PREIMAGE.leg1.cores,
+        PREIMAGE.leg1,
         PROPOSED_BROKER_CONFIG,
         leg1Marks,
     );
@@ -1039,6 +1146,7 @@ async function main() {
                 oldValidators: PREIMAGE.liveValidatorCount,
                 newValidators: PREIMAGE.leg1.validators,
                 cores: PREIMAGE.leg1.cores,
+                nDelayTranches: PREIMAGE.leg1.nDelayTranches,
             },
         );
     }
@@ -1050,6 +1158,7 @@ async function main() {
     const leg2Marks = {
         ct: (await head(ct)) + 1,
         relay: (await head(relay)) + 1,
+        relayConfig: await relayConfigView(relay),
     };
     for (let attempt = 1; attempt <= 3; attempt++) {
         await settle(ah);
@@ -1114,9 +1223,11 @@ async function main() {
         names(leg2Events, /^utility\./),
     );
     eq(
-        "polkadotXcm.Sent to Coretime",
-        find(leg2Events, "polkadotXcm.Sent").length,
-        1,
+        "polkadotXcm.Sent to the relay, then to Coretime",
+        find(leg2Events, "polkadotXcm.Sent").map((e) =>
+            e.event.data.destination.toJSON(),
+        ),
+        [RELAY_DEST.v5, CORETIME_DEST.v5],
     );
     eq(
         "AH validatorCount = 300",
@@ -1132,7 +1243,7 @@ async function main() {
     const leg2Prop = await checkPropagation(
         "leg 2",
         { ct, relay },
-        PREIMAGE.leg2.cores,
+        PREIMAGE.leg2,
         PROPOSED_BROKER_CONFIG,
         leg2Marks,
     );
@@ -1148,6 +1259,7 @@ async function main() {
                 oldValidators: activeValidators,
                 newValidators: PREIMAGE.leg2.validators,
                 cores: PREIMAGE.leg2.cores,
+                nDelayTranches: PREIMAGE.leg2.nDelayTranches,
             },
         );
     }

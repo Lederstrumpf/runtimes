@@ -13,7 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Kusama validator set reduction 700 -> 500 -> 300, with cores in lockstep (140 -> 100 -> 60).
+//! Kusama validator set reduction 700 -> 500 -> 300, with cores in lockstep (140 -> 100 -> 60)
+//! and the relay's `n_delay_tranches` scaled with the set (299 -> 214 -> 128).
 //!
 //! Tests the WhitelistedCaller referendum on Kusama Asset Hub. The pinned bytes are the output of
 //! `dry-run/validator-set-reduction-500-300-preimage.sh` against live Kusama, and
@@ -22,15 +23,23 @@
 //! ```text
 //! whitelist.dispatch_whitelisted_call_with_preimage(utility.batch_all([
 //!   staking.set_validator_count(500),
+//!   polkadot_xcm.send(relay, [UnpaidExecution, Transact(Superuser,
+//!     configuration.set_n_delay_tranches(214))]),
 //!   polkadot_xcm.send(Coretime, [UnpaidExecution, Transact(Superuser,
 //!     utility.batch_all([broker.request_core_count(100),
 //!                        broker.configure(live config, limit_cores_offered: Some(52))]))]),
 //!   scheduler.schedule_named_after("ksm-validator-set-reduction-leg2", 35 * DAYS, None, 63,
 //!     utility.batch_all([staking.set_validator_count(300),
+//!       polkadot_xcm.send(relay, [UnpaidExecution, Transact(Superuser,
+//!         configuration.set_n_delay_tranches(128))]),
 //!       polkadot_xcm.send(Coretime, [UnpaidExecution, Transact(Superuser,
 //!         broker.request_core_count(60))])])),
 //! ]))
 //! ```
+//!
+//! Approval voting draws each validator's delay tranche uniformly from `n_delay_tranches`, so
+//! validators per delay tranche is `validators / n_delay_tranches`. The new values keep the live
+//! 700 / 299 ratio. The relay applies them at session + 2, like `num_cores`.
 
 use crate::{
 	common::collectives_send_whitelist, imports::*,
@@ -62,22 +71,27 @@ type CtRuntime = <CoretimeKusama as Chain>::Runtime;
 type CtCall = <CoretimeKusama as Chain>::RuntimeCall;
 type CtEvent = <CoretimeKusama as Chain>::RuntimeEvent;
 type RcRuntime = <Kusama as Chain>::Runtime;
+type RcCall = <Kusama as Chain>::RuntimeCall;
 
 /// The inner `utility.batch_all`: to be whitelisted by Fellowship, and dispatched as Root by the
 /// whitelist pallet
-const PREIMAGE_INNER: [u8; 132] = hex!("28020c5909d1071f0005010100b50f05082f0000060200a02802083212640032000a000000c0890100c0890100b01300000084d71701340080c3c901b013000007056b736d2d76616c696461746f722d7365742d726564756374696f6e2d6c656732c0b00700003f2802085909b1041f0005010100b50f05082f00000602001032123c00");
+const PREIMAGE_INNER: [u8; 172] = hex!("2802105909d1071f0005010005082f0000060200183313d60000001f0005010100b50f05082f0000060200a02802083212640032000a000000c0890100c0890100b01300000084d71701340080c3c901b013000007056b736d2d76616c696461746f722d7365742d726564756374696f6e2d6c656732c0b00700003f28020c5909b1041f0005010005082f0000060200183313800000001f0005010100b50f05082f00000602001032123c00");
 /// blake2-256 of the inner call (what `whitelist.whitelist_call` takes).
 const PREIMAGE_INNER_BLAKE2_256: [u8; 32] =
-	hex!("18500999935b29c36f230b9dfc68786210c0355dbf2528e3c62ff6d7ac1e387e");
+	hex!("c7817c613b1756c81bf7139de882f6ecaff4d1e8835db2ce701404ef709280e8");
 /// Length and blake2-256 of the preimage (the outer call the referendum submits).
-const PREIMAGE_LEN: usize = 134;
+const PREIMAGE_LEN: usize = 174;
 const PREIMAGE_BLAKE2_256: [u8; 32] =
-	hex!("41e8d93e56dfb24ce4fa2016c7022eace1017916c032767d8a077d5b54f35d71");
-/// The leg-2 call (300 validators, 60 cores) that leg 1 stages in the scheduler, stored inline.
-const LEG2_STAGED_CALL: [u8; 28] = hex!("2802085909b1041f0005010100b50f05082f00000602001032123c00");
+	hex!("b4efb4f5228cfe09b6df3f8e4938a2e514febc7c8858f87751a65060f46f239c");
+/// The leg-2 call (300 validators, 60 cores, 128 tranches) that leg 1 stages in the scheduler,
+/// stored inline.
+const LEG2_STAGED_CALL: [u8; 48] = hex!("28020c5909b1041f0005010005082f0000060200183313800000001f0005010100b50f05082f00000602001032123c00");
 /// The Coretime call inside the leg-1 Transact.
 const PREIMAGE_CORETIME_LEG1: [u8; 40] =
 	hex!("2802083212640032000a000000c0890100c0890100b01300000084d71701340080c3c901b0130000");
+/// The relay calls inside the leg-1 and leg-2 Transacts.
+const PREIMAGE_RELAY_LEG1: [u8; 6] = hex!("3313d6000000");
+const PREIMAGE_RELAY_LEG2: [u8; 6] = hex!("331380000000");
 
 /// Proposal parameters
 const LEG2_ID: [u8; 32] = *b"ksm-validator-set-reduction-leg2";
@@ -86,6 +100,8 @@ const LEG1_VALIDATORS: u32 = 500;
 const LEG1_CORES: u16 = 100;
 const LEG2_VALIDATORS: u32 = 300;
 const LEG2_CORES: u16 = 60;
+const LEG1_N_DELAY_TRANCHES: u32 = 214;
+const LEG2_N_DELAY_TRANCHES: u32 = 128;
 const SALE_CAP: u16 = 52;
 const LEG2_AFTER: u32 = 35 * kusama_runtime_constants::time::DAYS;
 
@@ -94,6 +110,12 @@ const LIVE_VALIDATOR_COUNT: u32 = 700;
 const LIVE_NUM_CORES: u32 = 140;
 const LIVE_MAX_VALIDATORS_PER_CORE: u32 = 5;
 const LIVE_MAX_VALIDATORS: u32 = 700;
+const LIVE_N_DELAY_TRANCHES: u32 = 299;
+
+/// Validators per delay tranche may not drop below the plan's lowest steady state, 500 / 214
+/// (2.336; 700 / 299 is 2.341). Cutting validators before tranches would give 500 / 299.
+/// Compared as fractions: `v / t >= MIN.0 / MIN.1`.
+const MIN_PER_TRANCHE: (u32, u32) = (LEG1_VALIDATORS, LEG1_N_DELAY_TRANCHES);
 
 /// Live `broker.configuration` on Kusama Coretime. The emulated Coretime genesis has none, so
 /// `preimage_encoding_matches_pinned_bytes` decodes the pinned bytes and checks them against this
@@ -135,23 +157,34 @@ fn coretime_leg2_call() -> CtCall {
 	CtCall::Broker(pallet_broker::Call::<CtRuntime>::request_core_count { core_count: LEG2_CORES })
 }
 
-/// `polkadot_xcm.send` from AH to Coretime, in the shape the proposal uses (V5,
+fn relay_n_delay_tranches_call(new: u32) -> RcCall {
+	RcCall::Configuration(
+		runtime_parachains::configuration::Call::<RcRuntime>::set_n_delay_tranches { new },
+	)
+}
+
+/// `polkadot_xcm.send` from AH, in the shape the proposal uses (V5,
 /// `UnpaidExecution { Unlimited, None }`, `Transact { Superuser, None, call }`).
-fn send_to_coretime(call: CtCall) -> AhCall {
+fn send_from_ah(dest: Location, encoded_call: Vec<u8>) -> AhCall {
 	AhCall::PolkadotXcm(pallet_xcm::Call::<AhRuntime>::send {
-		dest: bx!(VersionedLocation::V5(Location::new(
-			1,
-			[Parachain(CoretimeKusama::para_id().into())]
-		))),
+		dest: bx!(VersionedLocation::V5(dest)),
 		message: bx!(VersionedXcm::V5(Xcm(vec![
 			UnpaidExecution { weight_limit: Unlimited, check_origin: None },
 			Transact {
 				origin_kind: OriginKind::Superuser,
 				fallback_max_weight: None,
-				call: call.encode().into(),
+				call: encoded_call.into(),
 			},
 		]))),
 	})
+}
+
+fn send_to_coretime(call: CtCall) -> AhCall {
+	send_from_ah(Location::new(1, [Parachain(CoretimeKusama::para_id().into())]), call.encode())
+}
+
+fn send_to_relay(call: RcCall) -> AhCall {
+	send_from_ah(Location::parent(), call.encode())
 }
 
 fn set_validator_count(new: u32) -> AhCall {
@@ -160,7 +193,11 @@ fn set_validator_count(new: u32) -> AhCall {
 
 fn leg2_call() -> AhCall {
 	AhCall::Utility(pallet_utility::Call::<AhRuntime>::batch_all {
-		calls: vec![set_validator_count(LEG2_VALIDATORS), send_to_coretime(coretime_leg2_call())],
+		calls: vec![
+			set_validator_count(LEG2_VALIDATORS),
+			send_to_relay(relay_n_delay_tranches_call(LEG2_N_DELAY_TRANCHES)),
+			send_to_coretime(coretime_leg2_call()),
+		],
 	})
 }
 
@@ -168,6 +205,7 @@ fn inner_call() -> AhCall {
 	AhCall::Utility(pallet_utility::Call::<AhRuntime>::batch_all {
 		calls: vec![
 			set_validator_count(LEG1_VALIDATORS),
+			send_to_relay(relay_n_delay_tranches_call(LEG1_N_DELAY_TRANCHES)),
 			send_to_coretime(coretime_leg1_call()),
 			AhCall::Scheduler(pallet_scheduler::Call::<AhRuntime>::schedule_named_after {
 				id: LEG2_ID,
@@ -201,6 +239,7 @@ fn setup_live_like_network() {
 		config.scheduler_params.num_cores = LIVE_NUM_CORES;
 		config.scheduler_params.max_validators_per_core = Some(LIVE_MAX_VALIDATORS_PER_CORE);
 		config.max_validators = Some(LIVE_MAX_VALIDATORS);
+		config.n_delay_tranches = LIVE_N_DELAY_TRANCHES;
 		ActiveConfig::<RcRuntime>::put(config);
 		assert!(PendingConfigs::<RcRuntime>::get().is_empty());
 	});
@@ -213,6 +252,7 @@ fn setup_live_like_network() {
 struct RelaySession {
 	session: u32,
 	active_num_cores: u32,
+	active_n_delay_tranches: u32,
 	/// Backing group size -> number of groups of that size (`ParaScheduler::ValidatorGroups`).
 	group_sizes: BTreeMap<usize, usize>,
 }
@@ -258,23 +298,63 @@ fn rotate_relay_session(n_validators: u32) -> RelaySession {
 		RelaySession {
 			session: next,
 			active_num_cores: ActiveConfig::<RcRuntime>::get().scheduler_params.num_cores,
+			active_n_delay_tranches: ActiveConfig::<RcRuntime>::get().n_delay_tranches,
 			group_sizes,
 		}
 	})
 }
 
-/// Relay checks after an AH leg: the broker's UMP was processed, and exactly one pending
-/// configuration is queued for session + 2 that differs from the active one only in `num_cores`.
-fn assert_relay_queued_num_cores(expected_num_cores: u32) {
+/// Rotate as `rotate_relay_session`, and check validators per delay tranche stays at or above
+/// `MIN_PER_TRANCHE`.
+fn rotate_and_check_tranches(n_validators: u32) -> RelaySession {
+	let s = rotate_relay_session(n_validators);
+	assert!(
+		n_validators * MIN_PER_TRANCHE.1 >= MIN_PER_TRANCHE.0 * s.active_n_delay_tranches,
+		"{n_validators} validators / {} tranches is below {}/{}: {s:?}",
+		s.active_n_delay_tranches,
+		MIN_PER_TRANCHE.0,
+		MIN_PER_TRANCHE.1,
+	);
+	s
+}
+
+/// Relay checks after an AH leg: AH's UMP (n_delay_tranches) and the broker's UMP (num_cores)
+/// were processed, and the last pending configuration, for session + 2, has both values. The two
+/// messages take different routes; if they straddled a session change there are two pending
+/// entries, so every entry may differ from the active config only in these two fields.
+fn assert_relay_queued(expected_num_cores: u32, expected_n_delay_tranches: u32) {
 	Kusama::execute_with(|| {
+		Kusama::assert_ump_queue_processed(true, Some(AssetHubKusama::para_id()), None);
 		Kusama::assert_ump_queue_processed(true, Some(CoretimeKusama::para_id()), None);
 		let pending = PendingConfigs::<RcRuntime>::get();
-		assert_eq!(pending.len(), 1, "expected one pending relay config, got {pending:?}");
 		let current = runtime_parachains::shared::CurrentSessionIndex::<RcRuntime>::get();
-		assert_eq!(pending[0].0, current + 2, "pending config must apply at session + 2");
-		let mut expected = ActiveConfig::<RcRuntime>::get();
-		expected.scheduler_params.num_cores = expected_num_cores;
-		assert_eq!(pending[0].1, expected, "only num_cores may change");
+		let (last_session, last) = pending.last().expect("a pending relay config");
+		assert_eq!(*last_session, current + 2, "pending config must apply at session + 2");
+		assert_eq!(
+			(last.scheduler_params.num_cores, last.n_delay_tranches),
+			(expected_num_cores, expected_n_delay_tranches)
+		);
+		let active = ActiveConfig::<RcRuntime>::get();
+		let masked = |c: &runtime_parachains::configuration::HostConfiguration<u32>| {
+			let mut c = c.clone();
+			c.scheduler_params.num_cores = 0;
+			c.n_delay_tranches = 0;
+			c
+		};
+		for (session, config) in &pending {
+			assert_eq!(
+				masked(config),
+				masked(&active),
+				"pending config for session {session} may change only num_cores and n_delay_tranches"
+			);
+			assert!(
+				[active.scheduler_params.num_cores, expected_num_cores]
+					.contains(&config.scheduler_params.num_cores) &&
+					[active.n_delay_tranches, expected_n_delay_tranches]
+						.contains(&config.n_delay_tranches),
+				"{config:?}"
+			);
+		}
 	});
 }
 
@@ -320,6 +400,20 @@ fn preimage_encoding_matches_pinned_bytes() {
 		assert_eq!(pallet_broker::Configuration::<CtRuntime>::get(), None);
 	});
 
+	// Relay calls: configuration.set_n_delay_tranches(214), then (128).
+	for (bytes, n) in
+		[(PREIMAGE_RELAY_LEG1, LEG1_N_DELAY_TRANCHES), (PREIMAGE_RELAY_LEG2, LEG2_N_DELAY_TRANCHES)]
+	{
+		assert_eq!(
+			RcCall::decode(&mut &bytes[..]).expect("decodes as relay call"),
+			relay_n_delay_tranches_call(n)
+		);
+		assert_eq!(relay_n_delay_tranches_call(n).encode(), bytes.to_vec());
+	}
+	// Both keep validators per delay tranche at the live 700 / 299, rounded.
+	assert_eq!(LEG1_N_DELAY_TRANCHES, (LIVE_N_DELAY_TRANCHES * LEG1_VALIDATORS + 350) / 700);
+	assert_eq!(LEG2_N_DELAY_TRANCHES, (LIVE_N_DELAY_TRANCHES * LEG2_VALIDATORS + 350) / 700);
+
 	// Leg 2 (stored inline by the scheduler, so it must stay <= 128 bytes).
 	assert_eq!(leg2_call().encode(), LEG2_STAGED_CALL.to_vec());
 
@@ -354,9 +448,10 @@ fn preimage_legs_1_and_2_end_to_end() {
 	let inner = inner_call();
 	let inner_hash = call_hash_of::<AssetHubKusama>(&inner);
 
-	// Before: 700 validators, 140 cores -> 140 groups of 5.
-	let s = rotate_relay_session(LIVE_VALIDATOR_COUNT);
+	// Before: 700 validators, 140 cores -> 140 groups of 5, 299 delay tranches.
+	let s = rotate_and_check_tranches(LIVE_VALIDATOR_COUNT);
 	assert_eq!(s.active_num_cores, LIVE_NUM_CORES);
+	assert_eq!(s.active_n_delay_tranches, LIVE_N_DELAY_TRANCHES);
 	assert_eq!(s.group_sizes, groups(&[(5, 140)]), "{s:?}");
 
 	// ---- Leg 1 ----
@@ -371,7 +466,13 @@ fn preimage_legs_1_and_2_end_to_end() {
 			AssetHubKusama,
 			vec![
 				AhEvent::Utility(pallet_utility::Event::BatchCompleted) => {},
-				AhEvent::PolkadotXcm(pallet_xcm::Event::Sent { .. }) => {},
+				AhEvent::PolkadotXcm(pallet_xcm::Event::Sent { destination, .. }) => {
+					destination: *destination == Location::parent(),
+				},
+				AhEvent::PolkadotXcm(pallet_xcm::Event::Sent { destination, .. }) => {
+					destination: *destination ==
+						Location::new(1, [Parachain(CoretimeKusama::para_id().into())]),
+				},
 				AhEvent::Scheduler(pallet_scheduler::Event::Scheduled { when, index }) => {
 					when: *when == expected_when,
 					index: *index == 0,
@@ -430,18 +531,29 @@ fn preimage_legs_1_and_2_end_to_end() {
 		);
 	});
 
-	// Relay after leg 1: num_cores 100 queued for session + 2.
-	assert_relay_queued_num_cores(LEG1_CORES.into());
+	// Relay after leg 1: num_cores 100 and n_delay_tranches 214 queued for session + 2.
+	assert_relay_queued(LEG1_CORES.into(), LEG1_N_DELAY_TRANCHES);
 
-	// Sessions after leg 1: cores drop first (validators still 700, so still 140 groups of 5),
-	// then the 500 set gives 100 groups of 5.
-	let s = rotate_relay_session(LIVE_VALIDATOR_COUNT);
-	assert_eq!((s.active_num_cores, s.group_sizes.clone()), (LIVE_NUM_CORES, groups(&[(5, 140)])));
-	let s = rotate_relay_session(LIVE_VALIDATOR_COUNT);
-	assert_eq!((s.active_num_cores, s.group_sizes.clone()), (100, groups(&[(5, 140)])), "{s:?}");
+	// Sessions after leg 1: cores and tranches drop first (validators still 700, so still 140
+	// groups of 5, and 700 / 214 per tranche), then the 500 set gives 100 groups of 5.
+	let s = rotate_and_check_tranches(LIVE_VALIDATOR_COUNT);
+	assert_eq!(
+		(s.active_num_cores, s.active_n_delay_tranches, s.group_sizes.clone()),
+		(LIVE_NUM_CORES, LIVE_N_DELAY_TRANCHES, groups(&[(5, 140)]))
+	);
+	let s = rotate_and_check_tranches(LIVE_VALIDATOR_COUNT);
+	assert_eq!(
+		(s.active_num_cores, s.active_n_delay_tranches, s.group_sizes.clone()),
+		(100, LEG1_N_DELAY_TRANCHES, groups(&[(5, 140)])),
+		"{s:?}"
+	);
 	assert_eq!(broker_core_count_inbox(), Some(LEG1_CORES), "relay notifies the broker");
-	let s = rotate_relay_session(LEG1_VALIDATORS);
-	assert_eq!((s.active_num_cores, s.group_sizes.clone()), (100, groups(&[(5, 100)])), "{s:?}");
+	let s = rotate_and_check_tranches(LEG1_VALIDATORS);
+	assert_eq!(
+		(s.active_num_cores, s.active_n_delay_tranches, s.group_sizes.clone()),
+		(100, LEG1_N_DELAY_TRANCHES, groups(&[(5, 100)])),
+		"{s:?}"
+	);
 
 	// ---- Leg 2: advance the AH scheduler's clock (relay block number) to the leg-2 slot ----
 	Kusama::ext_wrapper(|| <Kusama as Chain>::System::set_block_number(when));
@@ -472,7 +584,13 @@ fn preimage_legs_1_and_2_end_to_end() {
 					result: result.is_ok(),
 				},
 				AhEvent::Utility(pallet_utility::Event::BatchCompleted) => {},
-				AhEvent::PolkadotXcm(pallet_xcm::Event::Sent { .. }) => {},
+				AhEvent::PolkadotXcm(pallet_xcm::Event::Sent { destination, .. }) => {
+					destination: *destination == Location::parent(),
+				},
+				AhEvent::PolkadotXcm(pallet_xcm::Event::Sent { destination, .. }) => {
+					destination: *destination ==
+						Location::new(1, [Parachain(CoretimeKusama::para_id().into())]),
+				},
 			]
 		);
 		assert_eq!(pallet_staking_async::ValidatorCount::<AhRuntime>::get(), LEG2_VALIDATORS);
@@ -497,18 +615,30 @@ fn preimage_legs_1_and_2_end_to_end() {
 		);
 	});
 
-	// Relay after leg 2: num_cores 60 queued for session + 2.
-	assert_relay_queued_num_cores(LEG2_CORES.into());
+	// Relay after leg 2: num_cores 60 and n_delay_tranches 128 queued for session + 2.
+	assert_relay_queued(LEG2_CORES.into(), LEG2_N_DELAY_TRANCHES);
 
-	// Sessions after leg 2: cores drop first (500 validators -> still 100 groups of 5), then the
-	// 300 set gives 60 groups of 5.
-	let s = rotate_relay_session(LEG1_VALIDATORS);
-	assert_eq!((s.active_num_cores, s.group_sizes.clone()), (100, groups(&[(5, 100)])), "{s:?}");
-	let s = rotate_relay_session(LEG1_VALIDATORS);
-	assert_eq!((s.active_num_cores, s.group_sizes.clone()), (60, groups(&[(5, 100)])), "{s:?}");
+	// Sessions after leg 2: cores and tranches drop first (500 validators -> still 100 groups of
+	// 5, and 500 / 128 per tranche), then the 300 set gives 60 groups of 5.
+	let s = rotate_and_check_tranches(LEG1_VALIDATORS);
+	assert_eq!(
+		(s.active_num_cores, s.active_n_delay_tranches, s.group_sizes.clone()),
+		(100, LEG1_N_DELAY_TRANCHES, groups(&[(5, 100)])),
+		"{s:?}"
+	);
+	let s = rotate_and_check_tranches(LEG1_VALIDATORS);
+	assert_eq!(
+		(s.active_num_cores, s.active_n_delay_tranches, s.group_sizes.clone()),
+		(60, LEG2_N_DELAY_TRANCHES, groups(&[(5, 100)])),
+		"{s:?}"
+	);
 	assert_eq!(broker_core_count_inbox(), Some(LEG2_CORES), "relay notifies the broker");
-	let s = rotate_relay_session(LEG2_VALIDATORS);
-	assert_eq!((s.active_num_cores, s.group_sizes.clone()), (60, groups(&[(5, 60)])), "{s:?}");
+	let s = rotate_and_check_tranches(LEG2_VALIDATORS);
+	assert_eq!(
+		(s.active_num_cores, s.active_n_delay_tranches, s.group_sizes.clone()),
+		(60, LEG2_N_DELAY_TRANCHES, groups(&[(5, 60)])),
+		"{s:?}"
+	);
 	assert!(s.session > 0);
 }
 
@@ -603,6 +733,7 @@ fn relay_backing_groups_table() {
 		});
 		let s = rotate_relay_session(validators);
 		assert_eq!(s.active_num_cores, cores);
+		assert_eq!(s.active_n_delay_tranches, LIVE_N_DELAY_TRANCHES, "groups don't touch tranches");
 		assert_eq!(s.group_sizes, groups(expected), "{validators} validators x {cores} cores");
 	}
 }
