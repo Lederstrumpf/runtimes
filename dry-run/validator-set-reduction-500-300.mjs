@@ -94,6 +94,8 @@ Options:
   --skip-sessions         Skip all relay session rotations (no group checks)
   --preimage-json <path>  Cross-check the pinned bytes against the --json output of
                           validator-set-reduction-500-300-preimage.sh
+  --onchain-preimage      Enact the proposal from the preimage noted on the AH fork
+                          instead of writing one (fails if it is not noted there)
   --out <path>            Write all checks as JSON to this file
   --help                  Show this help
 `);
@@ -109,6 +111,7 @@ function parseArgs() {
         full: false,
         skipSessions: false,
         preimageJson: null,
+        onchainPreimage: false,
         out: null,
     };
     for (let i = 0; i < args.length; i++) {
@@ -130,6 +133,9 @@ function parseArgs() {
                 break;
             case "--preimage-json":
                 opts.preimageJson = args[++i];
+                break;
+            case "--onchain-preimage":
+                opts.onchainPreimage = true;
                 break;
             case "--out":
                 opts.out = args[++i];
@@ -310,6 +316,59 @@ async function whitelist(ah, present) {
     await ah.rpc("dev_setStorage", [[key, present ? "0x" : null]]);
 }
 
+let onchainPreimage = false; // --onchain-preimage
+
+/**
+ * With --onchain-preimage: check the proposal preimage noted on the fork, then request it the way the
+ * scheduler does when referenda schedules the enactment (pallet-preimage do_request_preimage):
+ * Unrequested { ticket, len } becomes Requested { maybe_ticket: Some(ticket), count: 1, maybe_len:
+ * Some(len) }, an existing Requested gets count + 1. Only the status changes, the bytes stay as noted.
+ */
+async function requestOnchainPreimage(ah, callHex, hash, len) {
+    const bytes = await ah.query.preimage.preimageFor([hash, len]);
+    const status = await ah.query.preimage.requestStatusFor(hash);
+    const noted = check(
+        `on-chain preimage: PreimageFor(${hash}, ${len}) and RequestStatusFor exist on the AH fork`,
+        bytes.isSome && status.isSome,
+        { preimageFor: bytes.isSome, requestStatusFor: status.toJSON() },
+    );
+    if (!noted)
+        throw new Error(
+            `--onchain-preimage: preimage ${hash} (len ${len}) is not noted on the Asset Hub fork; fork a block after it was noted, or run without --onchain-preimage`,
+        );
+    const same = eq(
+        "on-chain preimage: PreimageFor bytes equal the proposal",
+        bytes.unwrap().toHex(),
+        callHex,
+    );
+    if (!same)
+        throw new Error(
+            "--onchain-preimage: the noted preimage differs from the proposal bytes",
+        );
+    const s = status.unwrap();
+    const requested = s.isUnrequested
+        ? {
+              maybeTicket: s.asUnrequested.ticket,
+              count: 1,
+              maybeLen: s.asUnrequested.len,
+          }
+        : {
+              ...s.asRequested.toJSON(),
+              count: s.asRequested.count.toNumber() + 1,
+          };
+    const value = ah.registry.createType(s.toRawType(), {
+        Requested: requested,
+    });
+    await ah.rpc("dev_setStorage", [
+        [ah.query.preimage.requestStatusFor.key(hash), value.toHex()],
+    ]);
+    eq(
+        `on-chain preimage: RequestStatusFor ${s.type} -> Requested, as the scheduler's request() leaves it`,
+        (await ah.query.preimage.requestStatusFor(hash)).unwrap().toJSON(),
+        value.toJSON(),
+    );
+}
+
 /**
  * Put `callHex` into the AH scheduler as a referendum enactment with `origin`, build one block, and
  * return the scheduler "now", the block and its events. AH's scheduler clock is the relay block
@@ -324,6 +383,9 @@ async function enact(ah, callHex, origin) {
     let call;
     if (len <= 128) {
         call = { Inline: callHex };
+    } else if (onchainPreimage && callHex === PREIMAGE.outerHex) {
+        call = { Lookup: { hash, len } };
+        await requestOnchainPreimage(ah, callHex, hash, len);
     } else {
         call = { Lookup: { hash, len } };
         // PreimageFor holds a length-prefixed BoundedVec<u8>: write the raw value.
@@ -757,6 +819,7 @@ async function sessionsAfterLeg(
 
 async function main() {
     const opts = parseArgs();
+    onchainPreimage = opts.onchainPreimage;
     console.log("--- Connecting ---");
     const [ah, relay, ct] = await Promise.all([
         connect(opts.assetHub, "Asset Hub"),

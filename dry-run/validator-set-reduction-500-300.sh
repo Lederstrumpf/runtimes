@@ -18,6 +18,7 @@
 #   --asset-hub-block <n>  Fork Asset Hub at block n         (default: latest)
 #   --coretime-block <n>   Fork Coretime at block n          (default: latest)
 #   --fresh-cache          Move the chopsticks storage caches to the trash before starting
+#   --onchain-preimage     Enact the proposal from the preimage noted on the AH fork (no PreimageFor write)
 #   --full / --skip-sessions / --preimage-json / --out: see validator-set-reduction-500-300.mjs --help
 #
 # Storage cache: each fork gets a chopsticks `db:` sqlite file in $VSR_CACHE_DIR (default
@@ -122,6 +123,30 @@ fork_alive() {
     };' "$1"
 }
 
+# A fork can build blocks when dev_newBlock moves its head within 90s (on upstream loss chopsticks
+# returns the old head, or hangs).
+fork_builds() {
+    node -e '
+    const w = new WebSocket(process.argv[1]);
+    const fail = (why) => { console.error(`  ${process.argv[1]}: ${why}`); process.exit(1); };
+    setTimeout(() => fail("dev_newBlock did not move the head in 90s"), 90000);
+    w.onerror = () => fail("cannot connect");
+    let id = 0, before;
+    const call = (method) => w.send(JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params: [] }));
+    w.onopen = () => call("chain_getHeader");
+    w.onmessage = (m) => {
+      const d = JSON.parse(m.data);
+      if (d.error) fail(`${d.id === 2 ? "dev_newBlock" : "chain_getHeader"}: ${JSON.stringify(d.error)}`);
+      if (d.id === 1) { before = parseInt(d.result.number, 16); call("dev_newBlock"); }
+      else if (d.id === 2) call("chain_getHeader");
+      else {
+        const now = parseInt(d.result.number, 16);
+        if (now > before) process.exit(0);
+        fail(`dev_newBlock left the head at #${now}`);
+      }
+    };' "$1"
+}
+
 CHOPSTICKS_PID=""
 WORKDIR=""
 cleanup() {
@@ -217,23 +242,36 @@ if [ "$ATTACH" -eq 0 ]; then
 fi
 
 STATUS=0
+# Watch the suite output for an upstream-loss ERROR (lastpipe: the loop runs in this shell).
+UPSTREAM_LOST=0
+shopt -s lastpipe
 node "$SCRIPT_DIR/validator-set-reduction-500-300.mjs" \
-    --asset-hub "$AH_WS" --relay "$RELAY_WS" --coretime "$CT_WS" ${PASS[@]+"${PASS[@]}"} || STATUS=1
+    --asset-hub "$AH_WS" --relay "$RELAY_WS" --coretime "$CT_WS" ${PASS[@]+"${PASS[@]}"} |
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line"
+        case "$line" in "ERROR: "*"upstream RPC"*) UPSTREAM_LOST=1 ;; esac
+    done || STATUS=1
 
 if [ "$REPORTS" -eq 1 ]; then
     # The report checks build relay blocks: do not run them on a dead fork or one whose upstream
     # RPC is gone (they'd fail with "WebSocket is not connected" or stall).
+    # They only use the relay, so only the relay fork has to build a block.
     alive=1
-    if [ -n "$CHOPSTICKS_PID" ] && ! kill -0 "$CHOPSTICKS_PID" 2>/dev/null; then
+    if [ "$UPSTREAM_LOST" -eq 1 ]; then
+        echo
+        echo "the suite lost an upstream RPC" >&2
+        alive=0
+    elif [ -n "$CHOPSTICKS_PID" ] && ! kill -0 "$CHOPSTICKS_PID" 2>/dev/null; then
         echo
         echo "chopsticks is no longer running" >&2
         alive=0
     else
         echo
-        echo "--- Checking the forks still respond (incl. an upstream storage read) ---"
+        echo "--- Checking the forks still respond (incl. an upstream storage read and a relay block) ---"
         for url in "$RELAY_WS" "$AH_WS" "$CT_WS"; do
             fork_alive "$url" || alive=0
         done
+        if [ "$alive" -eq 1 ]; then fork_builds "$RELAY_WS" || alive=0; fi
     fi
     if [ "$alive" -eq 1 ]; then
         for n in 500 300; do
@@ -242,7 +280,7 @@ if [ "$REPORTS" -eq 1 ]; then
             node "$SCRIPT_DIR/validator-set-report.mjs" --relay "$RELAY_WS" --validator-count "$n" --expect accepted || STATUS=1
         done
     else
-        echo "SKIPPED the validator-set-report.mjs checks: forks not responding or upstream RPC lost${WORKDIR:+ (see $WORKDIR/chopsticks.log)}" >&2
+        echo "SKIPPED the validator-set-report.mjs checks: forks not responding, relay not building blocks or upstream RPC lost${WORKDIR:+ (see $WORKDIR/chopsticks.log)}" >&2
         STATUS=1
     fi
 fi
